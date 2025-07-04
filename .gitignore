@@ -1,0 +1,31 @@
+# Ignore environment variable files
+.env
+*.env
+
+# Ignore Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+main
+
+# Ignore vendor directory (if using Go modules, you can exclude this)
+vendor/
+
+# Ignore log files
+*.log
+
+# Ignore temporary files and directories
+tmp/
+temp/
+*.tmp
+
+# macOS specific files
+.DS_Store
+
+# Editor-specific files
+*.swp
+*.swo
+.idea/
+.vscode/
